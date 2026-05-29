@@ -3,8 +3,15 @@ import {
   BASS_RANGE,
   MID_RANGE,
   TREBLE_RANGE,
-  BAND_SMOOTHING,
+  BASS_GAIN,
+  MID_GAIN,
+  TREBLE_GAIN,
   ANALYSER_SMOOTHING,
+  ENV_RELEASE,
+  BEAT_FLUX,
+  BEAT_MIN_LEVEL,
+  BEAT_DECAY,
+  BEAT_COOLDOWN_FRAMES,
 } from './constants';
 
 export interface AudioBands {
@@ -12,17 +19,19 @@ export interface AudioBands {
   mid: number;
   treble: number;
   overall: number;
+  /** 0..1 transient pulse that spikes on a detected beat and decays. */
+  beat: number;
 }
 
 /**
  * Tiny wrapper around the Web Audio API.
  *
- * Wraps an HTMLAudioElement so we get free play/pause/seek/duration/time
- * and route the audio through an AnalyserNode for FFT data on every frame.
+ * HTMLAudioElement -> MediaElementSource -> Analyser -> Gain -> destination.
+ * Splits the FFT into bass/mid/treble, runs a fast-attack/slow-release envelope
+ * for punch, and detects beats as onsets (sudden rises) in the bass band.
  *
- * AudioContext is lazily created on first init() call -- you must call this
- * from a user gesture (e.g. play-button click) to satisfy the browser's
- * autoplay policy.
+ * AudioContext is lazily created on first init() so it satisfies the browser's
+ * autoplay policy (must be called from a user gesture).
  */
 export class AudioEngine {
   private context: AudioContext | null = null;
@@ -33,11 +42,18 @@ export class AudioEngine {
 
   private frequencyData: Uint8Array<ArrayBuffer> = new Uint8Array(new ArrayBuffer(0));
 
-  // Smoothed band readings (we exponential-smooth them ourselves on top of
-  // the AnalyserNode's internal smoothing for an extra-creamy feel).
-  private smoothed: AudioBands = { bass: 0, mid: 0, treble: 0, overall: 0 };
+  // Enveloped band readings (fast attack, slow release).
+  private smoothed = { bass: 0, mid: 0, treble: 0, overall: 0 };
 
-  // Track the current blob URL so we can revoke it on next load.
+  // Beat (onset) detection state.
+  private prevBass = 0; // previous-frame PRE-GAIN bass, for flux
+  private beat = 0;
+  private beatCooldown = 0;
+
+  // Both the sphere and particle field call getBands() each frame; do the real
+  // DSP work once per frame and serve a cached value to the second caller.
+  private lastSample = 0;
+
   private currentBlobUrl: string | null = null;
 
   /** Lazily create the AudioContext. MUST be called from a user gesture. */
@@ -51,10 +67,7 @@ export class AudioEngine {
     this.context = new Ctor();
 
     this.audio = new Audio();
-    // No crossOrigin: all our sources are same-origin (blob URLs from
-    // uploads, or /demo.mp3 served by Vercel). Setting crossOrigin on a
-    // same-origin element makes Safari taint the stream and the analyser
-    // returns all-zeros — audio plays but the visualizer sees silence.
+    // No crossOrigin: all sources are same-origin (blob URLs / /demo.mp3).
     this.audio.preload = 'auto';
 
     this.source = this.context.createMediaElementSource(this.audio);
@@ -66,7 +79,6 @@ export class AudioEngine {
     this.gainNode = this.context.createGain();
     this.gainNode.gain.value = 1.0;
 
-    // source -> analyser -> gain -> destination
     this.source.connect(this.analyser);
     this.analyser.connect(this.gainNode);
     this.gainNode.connect(this.context.destination);
@@ -82,7 +94,6 @@ export class AudioEngine {
   async load(src: File | string): Promise<void> {
     if (!this.audio) throw new Error('AudioEngine not initialized');
 
-    // Free previous blob URL if any
     if (this.currentBlobUrl) {
       URL.revokeObjectURL(this.currentBlobUrl);
       this.currentBlobUrl = null;
@@ -98,7 +109,6 @@ export class AudioEngine {
 
     this.audio.src = url;
 
-    // Wait until enough has loaded to know the duration.
     await new Promise<void>((resolve, reject) => {
       if (!this.audio) return reject(new Error('no audio'));
       const onLoaded = () => {
@@ -119,8 +129,6 @@ export class AudioEngine {
 
   async play(): Promise<void> {
     if (!this.audio || !this.context) return;
-    // Safari frequently leaves the context 'suspended' or 'interrupted'
-    // even after init(). Resume right before playback, every time.
     if (this.context.state !== 'running') {
       try {
         await this.context.resume();
@@ -129,8 +137,6 @@ export class AudioEngine {
       }
     }
     await this.audio.play();
-    // One more nudge: on iOS/Safari the context can re-suspend the instant
-    // playback starts. Resuming again after play() reliably unsticks it.
     if (this.context.state !== 'running') {
       try {
         await this.context.resume();
@@ -170,27 +176,59 @@ export class AudioEngine {
   }
 
   /**
-   * Sample the analyser and return normalised 0..1 band readings.
-   * Returns a stable {bass:0, ...} object if not initialised yet.
+   * Sample the analyser and return normalised 0..1 band readings plus a beat
+   * pulse. Work is throttled to once per ~frame; the cached value is returned
+   * in between.
    */
   getBands(): AudioBands {
-    if (!this.analyser) return { ...this.smoothed };
+    if (!this.analyser) {
+      return { ...this.smoothed, beat: this.beat };
+    }
+
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (now - this.lastSample < 8) {
+      return { ...this.smoothed, beat: this.beat };
+    }
+    this.lastSample = now;
 
     this.analyser.getByteFrequencyData(this.frequencyData);
 
-    const rawBass = averageRange(this.frequencyData, BASS_RANGE);
-    const rawMid = averageRange(this.frequencyData, MID_RANGE);
-    const rawTreble = averageRange(this.frequencyData, TREBLE_RANGE);
-    const rawOverall = (rawBass + rawMid + rawTreble) / 3;
+    // Pre-gain (0..1) readings — kept un-clamped/un-gained so they retain
+    // headroom for the onset detector.
+    const bassRaw = averageRange(this.frequencyData, BASS_RANGE);
+    const midRaw = averageRange(this.frequencyData, MID_RANGE);
+    const trebleRaw = averageRange(this.frequencyData, TREBLE_RANGE);
 
-    // Exponential smoothing on top of AnalyserNode's smoothing.
-    const k = BAND_SMOOTHING;
-    this.smoothed.bass = lerp(this.smoothed.bass, rawBass, 1 - k);
-    this.smoothed.mid = lerp(this.smoothed.mid, rawMid, 1 - k);
-    this.smoothed.treble = lerp(this.smoothed.treble, rawTreble, 1 - k);
-    this.smoothed.overall = lerp(this.smoothed.overall, rawOverall, 1 - k);
+    // Gained + clamped — what the shader sees.
+    const gBass = clamp01(bassRaw * BASS_GAIN);
+    const gMid = clamp01(midRaw * MID_GAIN);
+    const gTreble = clamp01(trebleRaw * TREBLE_GAIN);
+    const gOverall = (gBass + gMid + gTreble) / 3;
 
-    return { ...this.smoothed };
+    // Fast attack, slow release -> transients punch, then ease out.
+    this.smoothed.bass = envelope(this.smoothed.bass, gBass);
+    this.smoothed.mid = envelope(this.smoothed.mid, gMid);
+    this.smoothed.treble = envelope(this.smoothed.treble, gTreble);
+    this.smoothed.overall = envelope(this.smoothed.overall, gOverall);
+
+    // Onset detection: a sudden RISE in (pre-gain) bass energy = a beat.
+    const flux = bassRaw - this.prevBass;
+    this.prevBass = bassRaw;
+    if (this.beatCooldown <= 0 && flux > BEAT_FLUX && bassRaw > BEAT_MIN_LEVEL) {
+      this.beat = 1;
+      this.beatCooldown = BEAT_COOLDOWN_FRAMES;
+    } else {
+      this.beat *= BEAT_DECAY;
+    }
+    this.beatCooldown -= 1;
+
+    return {
+      bass: this.smoothed.bass,
+      mid: this.smoothed.mid,
+      treble: this.smoothed.treble,
+      overall: this.smoothed.overall,
+      beat: this.beat,
+    };
   }
 
   /** Tear down everything. Safe to call from a useEffect cleanup. */
@@ -241,6 +279,11 @@ function averageRange(
   return avg / 255;
 }
 
-function lerp(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
+/** Peak follower: jump to raw on attack, ease toward raw on release. */
+function envelope(prev: number, raw: number): number {
+  return raw > prev ? raw : prev + (raw - prev) * ENV_RELEASE;
+}
+
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
 }
