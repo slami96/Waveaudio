@@ -1,59 +1,34 @@
 /**
- * Sphere fragment shader.
+ * Sphere fragment shader — SIMPLE version.
  *
- * Now that the vertex shader hands us a real per-pixel normal that follows the
- * displaced surface, we can light it like an actual 3D object:
- *   - diffuse + ambient    -> form and shadow in the valleys
- *   - tight specular        -> glints that sparkle with treble
- *   - Fresnel rim           -> glowing edge that pulses with bass / beats
- *   - crest tint            -> the raised peaks shift toward the glow colour and
- *                              are the bits that cross the (now tighter) bloom
- *                              threshold, so bloom kisses the peaks instead of
- *                              flooding the whole ball.
+ * Diffuse + ambient give the orb form. A Fresnel rim glow pulses with bass and
+ * the beat. Treble adds a sparkle on the specular highlight. A short flash on
+ * each beat. Nothing fancy — clean and readable.
  */
 export const sphereFragmentShader = /* glsl */ `
 uniform vec3  uColor;
 uniform vec3  uGlowColor;
-uniform float uAudioLevel;
 uniform float uBass;
 uniform float uTreble;
 uniform float uBeat;
 
-varying vec3  vNormal;
-varying vec3  vViewDir;
-varying float vPeak;
+varying vec3 vNormal;
+varying vec3 vViewDir;
 
 void main() {
   vec3 N = normalize(vNormal);
   vec3 V = normalize(vViewDir);
+  vec3 L = normalize(vec3(0.4, 0.7, 0.6));
 
-  // Key light (fixed direction, view-space-ish). Gives the surface form.
-  vec3  L     = normalize(vec3(0.5, 0.7, 0.6));
-  float diff  = clamp(dot(N, L), 0.0, 1.0);
-  float ambient = 0.22;
-
-  // Fresnel rim — meaningful now because N follows the displacement.
-  float fres = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 2.5);
-
-  // Tight specular glints; treble makes them sparkle.
+  float diff = clamp(dot(N, L), 0.0, 1.0);
+  float fres = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 2.0);
   vec3  H    = normalize(L + V);
-  float spec = pow(clamp(dot(N, H), 0.0, 1.0), 40.0);
+  float spec = pow(clamp(dot(N, H), 0.0, 1.0), 24.0);
 
-  // Shaded base colour.
-  vec3 base = uColor * (ambient + diff * 0.95);
-
-  // Raised crests shift toward the glow colour (and read brighter).
-  float crest = clamp(vPeak * 2.2, 0.0, 1.0);
-  vec3 color = mix(base, uGlowColor, crest * 0.65 + uAudioLevel * 0.10);
-
-  // Audio-reactive rim glow.
-  color += uGlowColor * fres * (0.45 + uBass * 1.6 + uBeat * 1.1);
-
-  // Specular pop.
-  color += vec3(1.0) * spec * (0.25 + uTreble * 0.9);
-
-  // Whole-surface flash on the beat.
-  color *= (0.9 + uBeat * 0.45);
+  vec3 color = uColor * (0.30 + diff * 0.80);
+  color += uGlowColor * fres * (0.55 + uBass * 1.3 + uBeat * 1.0); // rim pulse
+  color += vec3(1.0) * spec * (0.20 + uTreble * 1.2);             // treble sparkle
+  color *= (0.95 + uBeat * 0.40);                                 // beat flash
 
   gl_FragColor = vec4(color, 1.0);
 }
