@@ -12,6 +12,7 @@ import {
   BEAT_MIN_LEVEL,
   BEAT_DECAY,
   BEAT_COOLDOWN_FRAMES,
+  DEBUG_AUDIO,
 } from './constants';
 
 export interface AudioBands {
@@ -25,13 +26,9 @@ export interface AudioBands {
 
 /**
  * Tiny wrapper around the Web Audio API.
- *
  * HTMLAudioElement -> MediaElementSource -> Analyser -> Gain -> destination.
- * Splits the FFT into bass/mid/treble, runs a fast-attack/slow-release envelope
- * for punch, and detects beats as onsets (sudden rises) in the bass band.
- *
- * AudioContext is lazily created on first init() so it satisfies the browser's
- * autoplay policy (must be called from a user gesture).
+ * Splits the FFT into bass/mid/treble, runs a fast-attack/slow-release
+ * envelope, and detects beats as onsets (sudden rises) in the bass band.
  */
 export class AudioEngine {
   private context: AudioContext | null = null;
@@ -42,21 +39,17 @@ export class AudioEngine {
 
   private frequencyData: Uint8Array<ArrayBuffer> = new Uint8Array(new ArrayBuffer(0));
 
-  // Enveloped band readings (fast attack, slow release).
   private smoothed = { bass: 0, mid: 0, treble: 0, overall: 0 };
 
-  // Beat (onset) detection state.
   private prevBass = 0; // previous-frame PRE-GAIN bass, for flux
   private beat = 0;
   private beatCooldown = 0;
 
-  // Both the sphere and particle field call getBands() each frame; do the real
-  // DSP work once per frame and serve a cached value to the second caller.
   private lastSample = 0;
+  private lastLog = 0;
 
   private currentBlobUrl: string | null = null;
 
-  /** Lazily create the AudioContext. MUST be called from a user gesture. */
   async init(): Promise<void> {
     if (this.context) return;
 
@@ -67,7 +60,6 @@ export class AudioEngine {
     this.context = new Ctor();
 
     this.audio = new Audio();
-    // No crossOrigin: all sources are same-origin (blob URLs / /demo.mp3).
     this.audio.preload = 'auto';
 
     this.source = this.context.createMediaElementSource(this.audio);
@@ -90,7 +82,6 @@ export class AudioEngine {
     }
   }
 
-  /** Load a file (uploaded) or URL (e.g. /demo.mp3). */
   async load(src: File | string): Promise<void> {
     if (!this.audio) throw new Error('AudioEngine not initialized');
 
@@ -133,7 +124,7 @@ export class AudioEngine {
       try {
         await this.context.resume();
       } catch {
-        /* resume can reject if called outside a gesture; ignore */
+        /* ignore */
       }
     }
     await this.audio.play();
@@ -175,11 +166,6 @@ export class AudioEngine {
     return this.audio;
   }
 
-  /**
-   * Sample the analyser and return normalised 0..1 band readings plus a beat
-   * pulse. Work is throttled to once per ~frame; the cached value is returned
-   * in between.
-   */
   getBands(): AudioBands {
     if (!this.analyser) {
       return { ...this.smoothed, beat: this.beat };
@@ -193,8 +179,7 @@ export class AudioEngine {
 
     this.analyser.getByteFrequencyData(this.frequencyData);
 
-    // Pre-gain (0..1) readings — kept un-clamped/un-gained so they retain
-    // headroom for the onset detector.
+    // Pre-gain (0..1), with headroom for the onset detector.
     const bassRaw = averageRange(this.frequencyData, BASS_RANGE);
     const midRaw = averageRange(this.frequencyData, MID_RANGE);
     const trebleRaw = averageRange(this.frequencyData, TREBLE_RANGE);
@@ -205,13 +190,12 @@ export class AudioEngine {
     const gTreble = clamp01(trebleRaw * TREBLE_GAIN);
     const gOverall = (gBass + gMid + gTreble) / 3;
 
-    // Fast attack, slow release -> transients punch, then ease out.
     this.smoothed.bass = envelope(this.smoothed.bass, gBass);
     this.smoothed.mid = envelope(this.smoothed.mid, gMid);
     this.smoothed.treble = envelope(this.smoothed.treble, gTreble);
     this.smoothed.overall = envelope(this.smoothed.overall, gOverall);
 
-    // Onset detection: a sudden RISE in (pre-gain) bass energy = a beat.
+    // Onset detection: a sudden RISE in pre-gain bass = a beat.
     const flux = bassRaw - this.prevBass;
     this.prevBass = bassRaw;
     if (this.beatCooldown <= 0 && flux > BEAT_FLUX && bassRaw > BEAT_MIN_LEVEL) {
@@ -222,6 +206,17 @@ export class AudioEngine {
     }
     this.beatCooldown -= 1;
 
+    if (DEBUG_AUDIO && now - this.lastLog > 250) {
+      this.lastLog = now;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[waveform] bass=${this.smoothed.bass.toFixed(2)} ` +
+          `mid=${this.smoothed.mid.toFixed(2)} ` +
+          `treble=${this.smoothed.treble.toFixed(2)} ` +
+          `beat=${this.beat.toFixed(2)}`,
+      );
+    }
+
     return {
       bass: this.smoothed.bass,
       mid: this.smoothed.mid,
@@ -231,7 +226,6 @@ export class AudioEngine {
     };
   }
 
-  /** Tear down everything. Safe to call from a useEffect cleanup. */
   async dispose(): Promise<void> {
     try {
       this.audio?.pause();
@@ -264,7 +258,6 @@ export class AudioEngine {
   }
 }
 
-/** Average a [lo, hi] inclusive range of a Uint8Array, normalised to 0..1. */
 function averageRange(
   data: Uint8Array<ArrayBuffer>,
   range: readonly [number, number],
@@ -275,11 +268,9 @@ function averageRange(
   if (b < a) return 0;
   let sum = 0;
   for (let i = a; i <= b; i++) sum += data[i];
-  const avg = sum / (b - a + 1);
-  return avg / 255;
+  return sum / (b - a + 1) / 255;
 }
 
-/** Peak follower: jump to raw on attack, ease toward raw on release. */
 function envelope(prev: number, raw: number): number {
   return raw > prev ? raw : prev + (raw - prev) * ENV_RELEASE;
 }
