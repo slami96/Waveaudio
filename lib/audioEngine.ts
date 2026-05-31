@@ -20,15 +20,15 @@ export interface AudioBands {
   mid: number;
   treble: number;
   overall: number;
-  /** 0..1 transient pulse that spikes on a detected beat and decays. */
   beat: number;
 }
 
 /**
  * Tiny wrapper around the Web Audio API.
  * HTMLAudioElement -> MediaElementSource -> Analyser -> Gain -> destination.
- * Splits the FFT into bass/mid/treble, runs a fast-attack/slow-release
- * envelope, and detects beats as onsets (sudden rises) in the bass band.
+ *
+ * Exposes getFrequencyData() (raw FFT bytes for the spectrum visualizer) and
+ * getBands() (aggregated bass/mid/treble + beat, kept for compatibility).
  */
 export class AudioEngine {
   private context: AudioContext | null = null;
@@ -40,11 +40,9 @@ export class AudioEngine {
   private frequencyData: Uint8Array<ArrayBuffer> = new Uint8Array(new ArrayBuffer(0));
 
   private smoothed = { bass: 0, mid: 0, treble: 0, overall: 0 };
-
-  private prevBass = 0; // previous-frame PRE-GAIN bass, for flux
+  private prevBass = 0;
   private beat = 0;
   private beatCooldown = 0;
-
   private lastSample = 0;
   private lastLog = 0;
 
@@ -166,6 +164,18 @@ export class AudioEngine {
     return this.audio;
   }
 
+  /**
+   * Raw FFT byte spectrum (length = frequencyBinCount, values 0..255).
+   * Returns null until init() has run. The spectrum visualizer reads this
+   * each frame. Low bins = bass, high bins = treble.
+   */
+  getFrequencyData(): Uint8Array<ArrayBuffer> | null {
+    if (!this.analyser) return null;
+    this.analyser.getByteFrequencyData(this.frequencyData);
+    return this.frequencyData;
+  }
+
+  /** Aggregated bands + beat. Kept for compatibility; unused by the spectrum. */
   getBands(): AudioBands {
     if (!this.analyser) {
       return { ...this.smoothed, beat: this.beat };
@@ -179,12 +189,10 @@ export class AudioEngine {
 
     this.analyser.getByteFrequencyData(this.frequencyData);
 
-    // Pre-gain (0..1), with headroom for the onset detector.
     const bassRaw = averageRange(this.frequencyData, BASS_RANGE);
     const midRaw = averageRange(this.frequencyData, MID_RANGE);
     const trebleRaw = averageRange(this.frequencyData, TREBLE_RANGE);
 
-    // Gained + clamped — what the shader sees.
     const gBass = clamp01(bassRaw * BASS_GAIN);
     const gMid = clamp01(midRaw * MID_GAIN);
     const gTreble = clamp01(trebleRaw * TREBLE_GAIN);
@@ -195,7 +203,6 @@ export class AudioEngine {
     this.smoothed.treble = envelope(this.smoothed.treble, gTreble);
     this.smoothed.overall = envelope(this.smoothed.overall, gOverall);
 
-    // Onset detection: a sudden RISE in pre-gain bass = a beat.
     const flux = bassRaw - this.prevBass;
     this.prevBass = bassRaw;
     if (this.beatCooldown <= 0 && flux > BEAT_FLUX && bassRaw > BEAT_MIN_LEVEL) {
