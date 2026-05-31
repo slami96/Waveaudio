@@ -128,14 +128,6 @@ export default function Page() {
             WAVEFORM
           </span>
         </div>
-        <div className="text-right">
-          <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-white/50">
-            Adam Slamen
-          </div>
-          <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-white/30 mt-0.5">
-            Creative Developer
-          </div>
-        </div>
       </header>
 
       {!hasTrack && <EmptyState themeSwatch={theme.swatch} />}
